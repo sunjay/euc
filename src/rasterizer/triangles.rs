@@ -27,6 +27,51 @@ impl<'a, D: Target<Item=f32>, B: BackfaceMode> Rasterizer for Triangles<'a, D, B
     ) {
         assert_eq!(target.size(), depth.size(), "Target and depth buffers are not similarly sized!");
 
+        match pipeline.get_depth_strategy() {
+            DepthStrategy::IfLessWrite | DepthStrategy::IfLessNoWrite => {
+                Triangles::<D, B>::draw_with_depth_strategy(pipeline, vertices, target, |[x, y], z_lerped| {
+                    let should_draw = z_lerped < unsafe { depth.get([x, y]) };
+                    if should_draw {
+                        // write depth only if we should draw it
+                        unsafe { depth.set([x, y], z_lerped) };
+                    }
+                    should_draw
+                })
+            },
+            DepthStrategy::IfMoreWrite | DepthStrategy::IfMoreNoWrite => {
+                Triangles::<D, B>::draw_with_depth_strategy(pipeline, vertices, target, |[x, y], z_lerped| {
+                    let should_draw = z_lerped > unsafe { depth.get([x, y]) };
+                    if should_draw {
+                        // write depth only if we should draw it
+                        unsafe { depth.set([x, y], z_lerped) };
+                    }
+                    should_draw
+                })
+            },
+            DepthStrategy::None => {
+                Triangles::<D, B>::draw_with_depth_strategy(pipeline, vertices, target, |_, _| true)
+            },
+        }
+
+    }
+}
+
+impl<'a, D: Target<Item=f32>, B: BackfaceMode> Triangles<'a, D, B> {
+    /// Rasterize implementation that uses the given closure to both check if we should draw and
+    /// update the depth buffer. This is an optimization to avoid branching on the depth strategy
+    /// in every loop iteration. The closure gets inlined and we create 3 copies of this pretty
+    /// big function, but it greatly increases our speed.
+    fn draw_with_depth_strategy<
+        P: Pipeline,
+        T: Target<Item=P::Pixel>,
+        F: FnMut([usize; 2], <D as Target>::Item) -> bool,
+    >(
+        pipeline: &P,
+        vertices: &[P::Vertex],
+        target: &mut T,
+        mut should_draw_update_depth: F,
+    ) {
+
         let size = Vec2::from(target.size());
         let half_scr = size.map(|e: usize| e as f32 * 0.5);
         const MIRROR: Vec2<f32> = Vec2 { x: 1.0, y: -1.0 };
@@ -116,16 +161,7 @@ impl<'a, D: Target<Item=f32>, B: BackfaceMode> Rasterizer for Triangles<'a, D, B
                         // Calculate the interpolated depth of this fragment
                         let z_lerped = f32::lerp3(a.z, b.z, c.z, wa, wb, wc);
 
-                        // Depth test
-                        let should_draw = match pipeline.get_depth_strategy() {
-                            DepthStrategy::IfLessWrite | DepthStrategy::IfLessNoWrite =>
-                                z_lerped < unsafe { depth.get([x, y]) },
-                            DepthStrategy::IfMoreWrite | DepthStrategy::IfMoreNoWrite =>
-                                z_lerped > unsafe { depth.get([x, y]) },
-                            DepthStrategy::None => true,
-                        };
-
-                        if should_draw {
+                        if should_draw_update_depth([x, y], z_lerped) {
                             // Calculate the interpolated vertex attributes of this fragment
                             let vs_out_lerped = P::VsOut::lerp3(
                                 a_vs_out.clone(),
@@ -137,13 +173,6 @@ impl<'a, D: Target<Item=f32>, B: BackfaceMode> Rasterizer for Triangles<'a, D, B
                             );
 
                             unsafe {
-                                // Write depth
-                                match pipeline.get_depth_strategy() {
-                                    DepthStrategy::IfLessWrite | DepthStrategy::IfMoreWrite =>
-                                        depth.set([x, y], z_lerped),
-                                    _ => {},
-                                }
-
                                 target.set([x, y], pipeline.frag(&vs_out_lerped));
                             }
                         }
